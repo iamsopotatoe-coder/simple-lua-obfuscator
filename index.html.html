@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Simple Open source Lua Obfuscator</title>
+<style>
+  body { margin: 20px; }
+  textarea { width: 100%; height: 300px; }
+  .row { display: flex; gap: 20px; flex-wrap: wrap; }
+  .col { flex: 1; min-width: 300px; }
+  footer { margin-top: 30px; border-top: 1px solid #000000; padding-top: 10px; font-size: 13px; }
+</style>
+</head>
+<body>
+
+<h1>Simple Open source Lua Obfuscator</h1>
+<p>Paste or upload a Lua file and click Obfuscate. Everything runs in your browser. (THIS IS A WEEKEND PROJECT AND DOES NOT PROVIDE MEANINGFUL PROTECTION)</p>
+
+<p>What it does:</p>
+<ul>
+  <li>Strips comments and extra whitespace</li>
+  <li>Renames local variables to random junk</li>
+  <li>Encodes string literals as string.char(...) calls</li>
+  <li>Encodes number literals as small arithmetic expressions</li>
+  <li>Inserts junk statements</li>
+</ul>
+
+<input type="file" id="fileInput" accept=".lua,.txt">
+<br>
+<button onclick="obfuscate()">Obfuscate</button>
+<button onclick="download()">Download Result</button>
+
+<div class="row">
+  <div class="col">
+    <h3>Input</h3>
+    <textarea id="input">-- example script, feel free to replace this
+local function greet(name)
+    local message = "Hello, " .. name .. "!"
+    print(message)
+end
+
+local function add(a, b)
+    return a + b
+end
+
+local total = add(2, 3)
+greet("World")
+print("Total is " .. total)</textarea>
+  </div>
+  <div class="col">
+    <h3>Output</h3>
+    <textarea id="output" readonly></textarea>
+  </div>
+</div>
+
+<footer>
+  Source on GitHub: <a href="https://github.com/iamsopotatoe-coder/lua-obfuscator" target="_blank">github.com/iamsopotatoe-coder/lua-obfuscator</a>
+</footer>
+
+<script>
+document.getElementById('fileInput').addEventListener('change', function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = evt => document.getElementById('input').value = evt.target.result;
+  reader.readAsText(file);
+});
+
+function randName(len) {
+  const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_';
+  let s = '_';
+  for (let i = 0; i < (len || 8); i++) s += chars[Math.floor(Math.random() * chars.length)];
+  return s;
+}
+
+// Strip // and -- 
+function stripComments(code) {
+  let out = '';
+  let i = 0;
+  let inStr = null; // ' or " or [[ marker
+  while (i < code.length) {
+    const c = code[i];
+
+    if (!inStr) {
+      if (c === "'" || c === '"') { inStr = c; out += c; i++; continue; }
+      if (code.slice(i, i + 2) === '[[') { inStr = ']]'; out += code.slice(i, i + 2); i += 2; continue; }
+      if (code.slice(i, i + 2) === '--') {
+        if (code.slice(i, i + 4) === '--[[') {
+          const end = code.indexOf(']]', i + 4);
+          i = end === -1 ? code.length : end + 2;
+          continue;
+        }
+        const end = code.indexOf('\n', i);
+        i = end === -1 ? code.length : end;
+        continue;
+      }
+      out += c; i++;
+    } else {
+      out += c;
+      if (inStr === "'" || inStr === '"') {
+        if (c === '\\') { out += code[i + 1] || ''; i += 2; continue; }
+        if (c === inStr) inStr = null;
+      } else if (inStr === ']]') {
+        if (code.slice(i, i + 2) === ']]') { inStr = null; out += code[i+1]||''; i += 2; continue; }
+      }
+      i++;
+    }
+  }
+  return out
+    .split('\n')
+    .map(l => l.trim())
+    .filter(l => l.length > 0)
+    .join('\n')
+    .replace(/[ \t]+/g, ' ');
+}
+
+// Encode string literals
+function encodeStrings(code) {
+  let out = '';
+  let i = 0;
+  while (i < code.length) {
+    const c = code[i];
+    if (c === "'" || c === '"') {
+      const quote = c;
+      let j = i + 1;
+      let raw = '';
+      while (j < code.length && code[j] !== quote) {
+        if (code[j] === '\\') { raw += code[j] + (code[j+1] || ''); j += 2; continue; }
+        raw += code[j]; j++;
+      }
+      let unescaped = raw
+        .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+        .replace(/\\"/g, '"').replace(/\\'/g, "'")
+        .replace(/\\\\/g, '\\');
+      const codes = Array.from(unescaped).map(ch => ch.charCodeAt(0));
+      if (codes.length === 0) {
+        out += '""';
+      } else {
+        out += '(string.char(' + codes.join(',') + '))';
+      }
+      i = j + 1;
+      continue;
+    }
+    out += c; i++;
+  }
+  return out;
+}
+
+// Encode standalone integer literals as arithmetic expressions,
+function encodeNumbers(code) {
+  return code.replace(/(^|[^\w.])(\d+)(?!\w)/g, (match, pre, numStr) => {
+    const n = parseInt(numStr, 10);
+    if (isNaN(n) || numStr.length > 6) return match;
+    const a = Math.floor(Math.random() * (n + 1));
+    const b = n - a;
+    return pre + '(' + a + '+' + b + ')';
+  });
+}
+
+// Very naive local variable renamer
+const KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function',
+  'goto','if','in','local','nil','not','or','repeat','return','then','true','until','while',
+  'print','string','table','math','pairs','ipairs','tostring','tonumber','require','pcall',
+  'type','setmetatable','getmetatable','self']);
+
+function renameLocals(code) {
+  const declRe = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  const names = new Set();
+  let m;
+  while ((m = declRe.exec(code)) !== null) {
+    if (!KEYWORDS.has(m[1])) names.add(m[1]);
+  }
+  const mapping = {};
+  names.forEach(n => { mapping[n] = randName(8); });
+
+  let result = code;
+  Object.keys(mapping).forEach(orig => {
+    const re = new RegExp('\\b' + orig + '\\b', 'g');
+    result = result.replace(re, mapping[orig]);
+  });
+  return result;
+}
+
+function insertJunk(code) {
+  const lines = code.split('\n');
+  const junkLines = [
+    'local ' + randName(6) + ' = ' + Math.floor(Math.random()*9999) + ';',
+    'if false then local ' + randName(5) + ' = 0 end;',
+    'do local ' + randName(5) + ' = "' + randName(4) + '" end;'
+  ];
+  const out = [];
+  lines.forEach(line => {
+    out.push(line);
+    if (Math.random() < 0.15) {
+      out.push(junkLines[Math.floor(Math.random() * junkLines.length)]);
+    }
+  });
+  return out.join('\n');
+}
+
+function obfuscate() {
+  let code = document.getElementById('input').value;
+  if (!code.trim()) { alert('Paste some Lua code first.'); return; }
+
+  code = stripComments(code);
+  code = renameLocals(code);
+  code = encodeStrings(code);
+  code = encodeNumbers(code);
+  code = insertJunk(code);
+
+  document.getElementById('output').value = code;
+}
+
+function download() {
+  const text = document.getElementById('output').value;
+  if (!text.trim()) { alert('Nothing to download yet, click Obfuscate first.'); return; }
+  const blob = new Blob([text], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'obfuscated.lua';
+  a.click();
+}
+</script>
+
+</body>
+</html>
