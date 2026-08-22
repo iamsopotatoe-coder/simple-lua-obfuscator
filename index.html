@@ -20,9 +20,10 @@
 <ul>
   <li>Strips comments and extra whitespace</li>
   <li>Renames local variables to random junk</li>
-  <li>Encodes string literals as string.char(...) calls</li>
+  <li>Encrypts string literals with a runtime key based decoder</li>
   <li>Encodes number literals as small arithmetic expressions</li>
   <li>Inserts junk statements</li>
+  <li>Wraps simple statements in always true opaque predicate blocks</li>
 </ul>
 
 <input type="file" id="fileInput" accept=".lua,.txt">
@@ -73,37 +74,62 @@ function randName(len) {
   return s;
 }
 
-// Strip // and -- 
+function longBracketLevel(code, i) {
+  if (code[i] !== '[') return -1;
+  let j = i + 1, level = 0;
+  while (code[j] === '=') { level++; j++; }
+  if (code[j] === '[') return level;
+  return -1;
+}
+
 function stripComments(code) {
   let out = '';
   let i = 0;
-  let inStr = null; // ' or " or [[ marker
+  let inStr = null;
   while (i < code.length) {
     const c = code[i];
 
     if (!inStr) {
       if (c === "'" || c === '"') { inStr = c; out += c; i++; continue; }
-      if (code.slice(i, i + 2) === '[[') { inStr = ']]'; out += code.slice(i, i + 2); i += 2; continue; }
+
+      const lvl = longBracketLevel(code, i);
+      if (lvl >= 0) {
+        const marker = ']' + '='.repeat(lvl) + ']';
+        inStr = marker;
+        out += code.slice(i, i + 2 + lvl);
+        i += 2 + lvl;
+        continue;
+      }
+
       if (code.slice(i, i + 2) === '--') {
-        if (code.slice(i, i + 4) === '--[[') {
-          const end = code.indexOf(']]', i + 4);
-          i = end === -1 ? code.length : end + 2;
+        const clvl = longBracketLevel(code, i + 2);
+        if (clvl >= 0) {
+          const marker = ']' + '='.repeat(clvl) + ']';
+          const end = code.indexOf(marker, i + 2 + 2 + clvl);
+          i = end === -1 ? code.length : end + marker.length;
           continue;
         }
         const end = code.indexOf('\n', i);
         i = end === -1 ? code.length : end;
         continue;
       }
+
       out += c; i++;
     } else {
-      out += c;
       if (inStr === "'" || inStr === '"') {
+        out += c;
         if (c === '\\') { out += code[i + 1] || ''; i += 2; continue; }
         if (c === inStr) inStr = null;
-      } else if (inStr === ']]') {
-        if (code.slice(i, i + 2) === ']]') { inStr = null; out += code[i+1]||''; i += 2; continue; }
+        i++;
+      } else {
+        if (code.slice(i, i + inStr.length) === inStr) {
+          out += inStr;
+          i += inStr.length;
+          inStr = null;
+          continue;
+        }
+        out += c; i++;
       }
-      i++;
     }
   }
   return out
@@ -114,7 +140,8 @@ function stripComments(code) {
     .replace(/[ \t]+/g, ' ');
 }
 
-// Encode string literals
+let STRING_KEY = 1;
+
 function encodeStrings(code) {
   let out = '';
   let i = 0;
@@ -125,18 +152,22 @@ function encodeStrings(code) {
       let j = i + 1;
       let raw = '';
       while (j < code.length && code[j] !== quote) {
-        if (code[j] === '\\') { raw += code[j] + (code[j+1] || ''); j += 2; continue; }
+        if (code[j] === '\\') { raw += code[j] + (code[j + 1] || ''); j += 2; continue; }
         raw += code[j]; j++;
       }
       let unescaped = raw
-        .replace(/\\n/g, '\n').replace(/\\t/g, '\t')
+        .replace(/\\a/g, '\x07').replace(/\\b/g, '\b').replace(/\\f/g, '\f')
+        .replace(/\\n/g, '\n').replace(/\\r/g, '\r').replace(/\\t/g, '\t').replace(/\\v/g, '\v')
+        .replace(/\\x([0-9a-fA-F]{2})/g, (m, h) => String.fromCharCode(parseInt(h, 16)))
+        .replace(/\\(\d{1,3})/g, (m, d) => String.fromCharCode(parseInt(d, 10) % 256))
+        .replace(/\\z\s*/g, '')
         .replace(/\\"/g, '"').replace(/\\'/g, "'")
         .replace(/\\\\/g, '\\');
-      const codes = Array.from(unescaped).map(ch => ch.charCodeAt(0));
+      const codes = Array.from(unescaped).map(ch => (ch.charCodeAt(0) + STRING_KEY) % 256);
       if (codes.length === 0) {
         out += '""';
       } else {
-        out += '(string.char(' + codes.join(',') + '))';
+        out += '(_D({' + codes.join(',') + '}))';
       }
       i = j + 1;
       continue;
@@ -146,25 +177,25 @@ function encodeStrings(code) {
   return out;
 }
 
-// Encode standalone integer literals as arithmetic expressions,
 function encodeNumbers(code) {
-  return code.replace(/(^|[^\w.])(\d+)(?!\w)/g, (match, pre, numStr) => {
-    const n = parseInt(numStr, 10);
-    if (isNaN(n) || numStr.length > 6) return match;
+  return code.replace(/(?<![\w.])\d+(?![\w.])/g, (match, offset, str) => {
+    const before = str.slice(Math.max(0, offset - 2), offset);
+    if (/0x$/i.test(before)) return match;
+    const n = parseInt(match, 10);
+    if (isNaN(n) || match.length > 6) return match;
     const a = Math.floor(Math.random() * (n + 1));
     const b = n - a;
-    return pre + '(' + a + '+' + b + ')';
+    return '(' + a + '+' + b + ')';
   });
 }
 
-// Very naive local variable renamer
 const KEYWORDS = new Set(['and','break','do','else','elseif','end','false','for','function',
   'goto','if','in','local','nil','not','or','repeat','return','then','true','until','while',
   'print','string','table','math','pairs','ipairs','tostring','tonumber','require','pcall',
   'type','setmetatable','getmetatable','self']);
 
 function renameLocals(code) {
-  const declRe = /\blocal\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  const declRe = /\blocal\s+(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)/g;
   const names = new Set();
   let m;
   while ((m = declRe.exec(code)) !== null) {
@@ -175,24 +206,67 @@ function renameLocals(code) {
 
   let result = code;
   Object.keys(mapping).forEach(orig => {
-    const re = new RegExp('\\b' + orig + '\\b', 'g');
+    const re = new RegExp('(?<![.:\\w])' + orig + '(?!\\w)', 'g');
     result = result.replace(re, mapping[orig]);
   });
   return result;
 }
 
+function lineOpensUnclosedBracket(line) {
+  const m = line.match(/\[(=*)\[/);
+  if (!m) return null;
+  const marker = ']' + m[1] + ']';
+  const afterOpenIdx = line.indexOf(m[0]) + m[0].length;
+  const closeIdx = line.indexOf(marker, afterOpenIdx);
+  return closeIdx === -1 ? marker : null;
+}
+
 function insertJunk(code) {
   const lines = code.split('\n');
   const junkLines = [
-    'local ' + randName(6) + ' = ' + Math.floor(Math.random()*9999) + ';',
+    'local ' + randName(6) + ' = ' + Math.floor(Math.random() * 9999) + ';',
     'if false then local ' + randName(5) + ' = 0 end;',
     'do local ' + randName(5) + ' = "' + randName(4) + '" end;'
   ];
   const out = [];
+  let openMarker = null;
   lines.forEach(line => {
     out.push(line);
+    if (openMarker) {
+      if (line.indexOf(openMarker) !== -1) openMarker = null;
+      return;
+    }
+    const opens = lineOpensUnclosedBracket(line);
+    if (opens) { openMarker = opens; return; }
+    if (/^\s*return\b/.test(line)) return;
     if (Math.random() < 0.15) {
       out.push(junkLines[Math.floor(Math.random() * junkLines.length)]);
+    }
+  });
+  return out.join('\n');
+}
+
+const CFG_RISKY = /\b(function|end|if|then|else|elseif|for|while|do|until|repeat|return|goto|break|local)\b/;
+
+function opaqueWrap(code) {
+  const lines = code.split('\n');
+  const out = [];
+  let openMarker = null;
+  lines.forEach(line => {
+    if (openMarker) {
+      out.push(line);
+      if (line.indexOf(openMarker) !== -1) openMarker = null;
+      return;
+    }
+    const opens = lineOpensUnclosedBracket(line);
+    if (opens) { openMarker = opens; out.push(line); return; }
+    const trimmed = line.trim();
+    if (trimmed.length > 0 && !CFG_RISKY.test(trimmed) && Math.random() < 0.2) {
+      const a = Math.floor(Math.random() * 50) + 1;
+      const b = Math.floor(Math.random() * 50) + 1;
+      out.push('if ((' + a + '*' + a + '+' + b + '*' + b + ')>=0) then ' + trimmed + ' end');
+    } else {
+      out.push(line);
     }
   });
   return out.join('\n');
@@ -202,11 +276,16 @@ function obfuscate() {
   let code = document.getElementById('input').value;
   if (!code.trim()) { alert('Paste some Lua code first.'); return; }
 
+  STRING_KEY = Math.floor(Math.random() * 254) + 1;
+  const decoder = 'local function _D(t) local s="" for i=1,#t do local v=(t[i]-' + STRING_KEY + ') if v<0 then v=v+256 end s=s..string.char(v) end return s end';
+
   code = stripComments(code);
   code = renameLocals(code);
   code = encodeStrings(code);
   code = encodeNumbers(code);
   code = insertJunk(code);
+  code = opaqueWrap(code);
+  code = decoder + '\n' + code;
 
   document.getElementById('output').value = code;
 }
